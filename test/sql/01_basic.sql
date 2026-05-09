@@ -1,0 +1,65 @@
+-- sql/01_basic.sql — create, call, verify prosrc is wrapped
+CREATE EXTENSION plpgsql_wrap;
+
+-- 1. Create a wrapped function — identical syntax to LANGUAGE plpgsql
+CREATE OR REPLACE FUNCTION public.wrap_add(a integer, b integer)
+RETURNS integer
+LANGUAGE plpgsql_wrap
+AS $$
+BEGIN
+    RETURN a + b;
+END;
+$$;
+
+-- 2. Call it — transparent execution
+SELECT wrap_add(19, 23);     -- expect 42
+
+-- 3. prosrc must start with the wrap prefix, never show plain source
+SELECT prosrc LIKE 'PLPGSQLWRAP:1:%' AS is_wrapped
+FROM   pg_catalog.pg_proc
+WHERE  proname = 'wrap_add';
+-- expect: t
+
+-- 4. pg_get_functiondef also shows only the wrapped blob
+SELECT pg_catalog.pg_get_functiondef(p.oid) LIKE '%PLPGSQLWRAP:1:%' AS def_wrapped
+FROM   pg_catalog.pg_proc p
+WHERE  proname = 'wrap_add';
+-- expect: t
+
+-- 5. information_schema hides source too
+SELECT routine_definition LIKE 'PLPGSQLWRAP:1:%' AS schema_wrapped
+FROM   information_schema.routines
+WHERE  routine_name = 'wrap_add';
+-- expect: t
+
+-- 6. Audit list
+SELECT schema, func_name, return_type, wrapped_chars > 0 AS has_blob
+FROM   plpgsql_wrap.list_wrapped()
+WHERE  func_name = 'wrap_add';
+
+-- 7. Syntax error is caught BEFORE wrapping (validator runs first)
+DO $$
+BEGIN
+    BEGIN
+        EXECUTE $dyn$
+            CREATE OR REPLACE FUNCTION public.wrap_bad()
+            RETURNS void LANGUAGE plpgsql_wrap AS $src$
+            BEGIN
+                THIS IS NOT VALID PLPGSQL;
+            END;
+            $src$
+        $dyn$;
+        RAISE EXCEPTION 'should not reach here';
+    EXCEPTION WHEN OTHERS THEN
+        -- Expected: syntax error from plpgsql validator
+        RAISE NOTICE 'Caught expected error: %', SQLERRM;
+    END;
+END;
+$$;
+
+-- wrap_bad must NOT exist (transaction rolled back)
+SELECT count(*) FROM pg_proc WHERE proname = 'wrap_bad';
+-- expect: 0
+
+-- Cleanup
+DROP FUNCTION public.wrap_add(integer, integer);
