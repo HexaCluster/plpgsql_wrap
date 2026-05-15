@@ -11,7 +11,8 @@
 # Tests:
 #   make installcheck
 
-MODULES    = plpgsql_wrap
+MODULE_big = plpgsql_wrap
+OBJS       = plpgsql_wrap.o
 EXTENSION  = plpgsql_wrap
 DATA       = $(wildcard updates/*--*.sql) $(wildcard sql/*.sql)
 DOCS       = README.md
