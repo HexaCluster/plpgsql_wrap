@@ -8,6 +8,8 @@ BEGIN
     RETURN i * 2;
 END
 $$;
+WARNING:  plpgsql_wrap was built with the default all-zero key, wrapped code is not protected
+HINT:  Rebuild with make WRAP_KEY_HEX=$(openssl rand -hex 32) after unwrapping existing functions.
 CREATE TEMP TABLE ch_before AS
     SELECT xmin::text AS x, ctid::text AS t FROM pg_proc WHERE proname = 'ch_double';
 SELECT ch_double(21);
@@ -41,6 +43,8 @@ BEGIN
     RETURN n * ch_fact(n - 1);
 END
 $$;
+WARNING:  plpgsql_wrap was built with the default all-zero key, wrapped code is not protected
+HINT:  Rebuild with make WRAP_KEY_HEX=$(openssl rand -hex 32) after unwrapping existing functions.
 SELECT ch_fact(10);
  ch_fact 
 ---------
@@ -53,6 +57,8 @@ BEGIN
     RETURN a;
 END
 $$;
+WARNING:  plpgsql_wrap was built with the default all-zero key, wrapped code is not protected
+HINT:  Rebuild with make WRAP_KEY_HEX=$(openssl rand -hex 32) after unwrapping existing functions.
 SELECT ch_poly(3), ch_poly('x'::text);
  ch_poly | ch_poly 
 ---------+---------
@@ -65,6 +71,8 @@ BEGIN
     FOR i IN 1..n LOOP RETURN NEXT i; END LOOP;
 END
 $$;
+WARNING:  plpgsql_wrap was built with the default all-zero key, wrapped code is not protected
+HINT:  Rebuild with make WRAP_KEY_HEX=$(openssl rand -hex 32) after unwrapping existing functions.
 SELECT * FROM ch_srf(3);
  ch_srf 
 --------
@@ -81,6 +89,8 @@ BEGIN
     RETURN NEW;
 END
 $$;
+WARNING:  plpgsql_wrap was built with the default all-zero key, wrapped code is not protected
+HINT:  Rebuild with make WRAP_KEY_HEX=$(openssl rand -hex 32) after unwrapping existing functions.
 CREATE TRIGGER ch_t BEFORE INSERT ON ch_tab FOR EACH ROW EXECUTE FUNCTION ch_trg();
 INSERT INTO ch_tab (a) VALUES (1), (2);
 SELECT * FROM ch_tab ORDER BY a;
@@ -96,6 +106,8 @@ BEGIN
     RAISE EXCEPTION 'boom';
 END
 $$;
+WARNING:  plpgsql_wrap was built with the default all-zero key, wrapped code is not protected
+HINT:  Rebuild with make WRAP_KEY_HEX=$(openssl rand -hex 32) after unwrapping existing functions.
 SELECT ch_boom();
 ERROR:  boom
 CONTEXT:  PL/pgSQL function ch_boom() line 3 at RAISE
@@ -120,6 +132,8 @@ BEGIN
     RETURN i * 100;
 END
 $$;
+WARNING:  plpgsql_wrap was built with the default all-zero key, wrapped code is not protected
+HINT:  Rebuild with make WRAP_KEY_HEX=$(openssl rand -hex 32) after unwrapping existing functions.
 SELECT ch_double(5);
  ch_double 
 -----------

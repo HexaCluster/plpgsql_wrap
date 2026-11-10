@@ -89,19 +89,28 @@
  *
  *   Fixed header: 33 bytes.  Prefix in prosrc: 14 chars ("PLPGSQLWRAP:1:").
  *
- * PER-SESSION CACHE
- * =================
- *   The call handler caches via fcinfo->flinfo->fn_extra, keyed on fn_oid.
- *   The cached struct records:
- *     - The OID and the pg_proc syscache generation at wrap time
- *     - The name of the permanent pg_temp dispatch function
- *   On invalidation (pg_proc changes), the cache entry is dropped and the
- *   dispatch function is re-created.
+ * PER-CALL-SITE CACHE
+ * ===================
+ *   The call handler caches in fcinfo->flinfo->fn_extra (WrapCacheEntry)
+ *   the plpgsql handler/compiler entry points and a persistent FmgrInfo
+ *   whose fn_extra holds plpgsql's compiled function.
  *
  * COMPILE-TIME KEY
  * ================
  *   Defined as WRAP_KEY_HEX in wrap_key.h (64 hex chars = 32 bytes).
  *   Override at build time:  make WRAP_KEY_HEX=<64 hex chars>
+ *   The build turns it into XOR-masked byte arrays (wrap_key_data.h): it
+ *   is never stored as a hex string in the .so.  This only defeats
+ *   strings(1)-style extraction; whoever can read and reverse the .so can
+ *   recover the key.  A WARNING is raised when code is wrapped with the
+ *   default all-zero key.
+ *
+ * SQL-CALLABLE ENTRY POINTS
+ * =========================
+ *   validator(oid) is callable by anybody with EXECUTE (revoked from
+ *   PUBLIC since 1.1) and checks CheckFunctionValidatorAccess() before
+ *   touching pg_proc.  verify_blob() is a plain C function (no SECURITY
+ *   DEFINER).  unwrap_procedure() is superuser only.
  *
  * BUILD
  * =====
@@ -139,14 +148,19 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/err.h>
+#include <openssl/crypto.h>
 #include <string.h>
 
 PG_MODULE_MAGIC;
 
 /* ====================================================================
  * Compile-time key
+ *
+ * wrap_key_data.h is generated at build time (tools/gen_key_header.sh)
+ * from WRAP_KEY_HEX / wrap_key.h.  It holds the key XOR-masked as byte
+ * arrays: the key never appears as a hex string literal in the .so.
  * ==================================================================== */
-#include "wrap_key.h"
+#include "wrap_key_data.h"
 
 /* ====================================================================
  * Wire-format constants
@@ -188,32 +202,64 @@ typedef struct WrapCacheEntry
  * ==================================================================== */
 static uint8_t g_key[WRAP_KEY_LEN];
 static bool    g_key_ready = false;
+static bool    g_key_is_default = false;   /* built with the all-zero key */
 
 void _PG_init(void);
 
 void
 _PG_init(void)
 {
-    const char *hex = WRAP_KEY_HEX;
-    int         i;
+    int     i;
+    uint8_t acc = 0;
 
-    if (strlen(hex) != WRAP_KEY_LEN * 2)
-        ereport(FATAL,
-                (errcode(ERRCODE_CONFIG_FILE_ERROR),
-                 errmsg("plpgsql_wrap: WRAP_KEY_HEX must be exactly 64 hex chars "
-                        "(got %zu)", strlen(hex))));
+    StaticAssertStmt(sizeof(wrap_key_masked) == WRAP_KEY_LEN &&
+                     sizeof(wrap_key_mask) == WRAP_KEY_LEN,
+                     "wrap_key_data.h must hold a 32-byte key");
 
     for (i = 0; i < WRAP_KEY_LEN; i++)
     {
-        unsigned int b;
-        if (sscanf(hex + 2*i, "%02x", &b) != 1)
-            ereport(FATAL,
-                    (errcode(ERRCODE_CONFIG_FILE_ERROR),
-                     errmsg("plpgsql_wrap: invalid hex at position %d in WRAP_KEY_HEX",
-                            2*i)));
-        g_key[i] = (uint8_t) b;
+        g_key[i] = wrap_key_masked[i] ^ wrap_key_mask[i];
+        acc |= g_key[i];
     }
+    g_key_is_default = (acc == 0);
     g_key_ready = true;
+}
+
+/*
+ * Warn when wrapping code with the default all-zero key: anybody can
+ * decrypt it.  Existing installations built that way must keep working,
+ * so this is a warning, not an error.
+ */
+static void
+warn_if_default_key(void)
+{
+    if (g_key_is_default)
+        ereport(WARNING,
+                (errmsg("plpgsql_wrap was built with the default all-zero key, "
+                        "wrapped code is not protected"),
+                 errhint("Rebuild with make WRAP_KEY_HEX=$(openssl rand -hex 32) "
+                         "after unwrapping existing functions.")));
+}
+
+/* Hex digit value, -1 if not a hex digit (strict: no sign, no space) */
+static inline int
+hex_nibble(unsigned char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* OpenSSL error reason, never NULL; also clears the thread error queue */
+static const char *
+ossl_reason(void)
+{
+    unsigned long e      = ERR_get_error();
+    const char   *reason = e ? ERR_reason_error_string(e) : NULL;
+
+    ERR_clear_error();
+    return reason ? reason : "unknown error";
 }
 
 /* ====================================================================
@@ -233,8 +279,10 @@ aes_encrypt(const char *plaintext, int plen, int *out_len)
 
     Assert(g_key_ready);
 
+    ERR_clear_error();
     if (RAND_bytes(nonce, WRAP_NONCE_LEN) != 1)
-        ereport(ERROR, (errmsg("plpgsql_wrap: RAND_bytes failed")));
+        ereport(ERROR, (errmsg("plpgsql_wrap: RAND_bytes failed: %s",
+                               ossl_reason())));
 
     buf  = palloc0(WRAP_HDR_LEN + plen + EVP_MAX_BLOCK_LENGTH);
     body = buf + WRAP_HDR_LEN;
@@ -261,9 +309,10 @@ aes_encrypt(const char *plaintext, int plen, int *out_len)
 
 ossl_err:
     if (ctx) EVP_CIPHER_CTX_free(ctx);
+    explicit_bzero(buf, WRAP_HDR_LEN + plen + EVP_MAX_BLOCK_LENGTH);
     ereport(ERROR,
             (errmsg("plpgsql_wrap: OpenSSL encrypt error: %s",
-                    ERR_reason_error_string(ERR_get_error()))));
+                    ossl_reason())));
     return NULL;
 }
 
@@ -308,6 +357,7 @@ aes_decrypt(const uint8_t *blob, int blen)
 
     plain = (uint8_t *) palloc(clen + 1);
 
+    ERR_clear_error();
     ctx = EVP_CIPHER_CTX_new();
     if (!ctx) goto ossl_err;
     if (!EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL)) goto ossl_err;
@@ -319,7 +369,13 @@ aes_decrypt(const uint8_t *blob, int blen)
 
     if (EVP_DecryptFinal_ex(ctx, plain + olen, &tlen) <= 0)
     {
+        /*
+         * GCM writes the decrypted bytes before checking the tag: wipe
+         * them, they must not survive a failed authentication.
+         */
         EVP_CIPHER_CTX_free(ctx);
+        explicit_bzero(plain, clen + 1);
+        ERR_clear_error();
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
                  errmsg("plpgsql_wrap: authentication failed  --  "
@@ -333,9 +389,10 @@ aes_decrypt(const uint8_t *blob, int blen)
 
 ossl_err:
     if (ctx) EVP_CIPHER_CTX_free(ctx);
+    explicit_bzero(plain, clen + 1);
     ereport(ERROR,
             (errmsg("plpgsql_wrap: OpenSSL decrypt error: %s",
-                    ERR_reason_error_string(ERR_get_error()))));
+                    ossl_reason())));
     return NULL;
 }
 
@@ -413,15 +470,21 @@ prosrc_to_blob(const char *prosrc, int *out_len)
     *out_len = hexlen / 2;
     buf      = palloc(*out_len);
 
+    /*
+     * Strict, table-free decoding: sscanf("%02x") accepted signs and
+     * blanks, and was the main per-call cost for large functions.
+     */
     for (i = 0; i < *out_len; i++)
     {
-        unsigned int b;
-        if (sscanf(hex + 2*i, "%02x", &b) != 1)
+        int hi = hex_nibble((unsigned char) hex[2*i]);
+        int lo = hex_nibble((unsigned char) hex[2*i + 1]);
+
+        if (hi < 0 || lo < 0)
             ereport(ERROR,
                     (errcode(ERRCODE_DATA_CORRUPTED),
                      errmsg("plpgsql_wrap: invalid hex char in prosrc "
-                            "at position %d", 2*i)));
-        buf[i] = (uint8_t) b;
+                            "at position %d", (hi < 0) ? 2*i : 2*i + 1)));
+        buf[i] = (uint8_t) ((hi << 4) | lo);
     }
     return buf;
 }
@@ -625,6 +688,18 @@ pgwrap_validator(PG_FUNCTION_ARGS)
     bool        attr_isnull;
     Datum       prosrc_datum;
 
+    /*
+     * A validator is an ordinary SQL-callable function: anybody with
+     * EXECUTE on it can call it with any OID.  Without this check, an
+     * unprivileged user could have us rewrite (encrypt) the prosrc of any
+     * function in another language (plpgsql, sql, C...), destroying it.
+     * CheckFunctionValidatorAccess() errors out unless fn_oid really is a
+     * plpgsql_wrap function and the caller has USAGE on the language and
+     * EXECUTE on the function.
+     */
+    if (!CheckFunctionValidatorAccess(fcinfo->flinfo->fn_oid, fn_oid))
+        PG_RETURN_VOID();
+
     /* ---- Read prosrc from pg_proc ------------------------------ */
     tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(fn_oid));
     if (!HeapTupleIsValid(tup))
@@ -731,6 +806,7 @@ pgwrap_validator(PG_FUNCTION_ARGS)
     }
 
     /* Step 2: encrypt */
+    warn_if_default_key();
     {
         int      blen;
         uint8_t *blob      = aes_encrypt(prosrc, strlen(prosrc), &blen);
@@ -891,6 +967,7 @@ compile_with_plain_source(WrapCacheEntry *cache, FunctionCallInfo plfcinfo)
     Datum         prosrc_datum;
     char         *prosrc;
     char         *plain_src;
+    text         *plain_txt;
     Datum         values[Natts_pg_proc];
     bool          nulls[Natts_pg_proc];
     bool          replaces[Natts_pg_proc];
@@ -932,12 +1009,18 @@ compile_with_plain_source(WrapCacheEntry *cache, FunctionCallInfo plfcinfo)
     memset(values,   0, sizeof(values));
     memset(nulls,    false, sizeof(nulls));
     memset(replaces, false, sizeof(replaces));
-    values[Anum_pg_proc_prosrc - 1]   = CStringGetTextDatum(plain_src);
+    plain_txt = cstring_to_text(plain_src);
+    explicit_bzero(plain_src, strlen(plain_src));
+    pfree(plain_src);
+
+    values[Anum_pg_proc_prosrc - 1]   = PointerGetDatum(plain_txt);
     replaces[Anum_pg_proc_prosrc - 1] = true;
 
     plainTup = heap_modify_tuple(procTup, desc, values, nulls, replaces);
-    explicit_bzero(plain_src, strlen(plain_src));
-    pfree(plain_src);
+
+    /* the plain text has been copied into plainTup: wipe the copy we own */
+    explicit_bzero(plain_txt, VARSIZE(plain_txt));
+    pfree(plain_txt);
 
     /* Keep the identity plpgsql uses to validate its cache (xmin, ctid) */
     plainTup->t_data->t_choice = procTup->t_data->t_choice;
@@ -1012,7 +1095,7 @@ pgwrap_call_handler(PG_FUNCTION_ARGS)
                      errmsg("plpgsql_wrap: plpgsql has no call handler")));
 
         /* plpgsql's exported compiler entry point (also loads plpgsql) */
-        cache->plpgsql_compile = (plpgsql_compile_fn)
+        cache->plpgsql_compile = (plpgsql_compile_fn) (void *)
             load_external_function("$libdir/plpgsql", "plpgsql_compile",
                                    true, NULL);
 
@@ -1076,19 +1159,47 @@ pgwrap_call_handler(PG_FUNCTION_ARGS)
  *
  * args (optional): the identity argument string, e.g. "integer, text".
  * Required when the schema+name combination is ambiguous (overloading).
+ *
+ * The key is part of the statement text, so every error raised here is
+ * re-thrown with the STATEMENT hidden from the server log
+ * (log_min_error_statement).  log_statement = 'all' still logs it: see
+ * README, "Security notes".
  * ==================================================================== */
-PG_FUNCTION_INFO_V1(pgwrap_unwrap_procedure);
-Datum
-pgwrap_unwrap_procedure(PG_FUNCTION_ARGS)
-{
-    text  *key_t    = PG_GETARG_TEXT_PP(0);
-    text  *schema_t = PG_GETARG_TEXT_PP(1);
-    text  *name_t   = PG_GETARG_TEXT_PP(2);
 
-    char  *key      = text_to_cstring(key_t);
-    char  *schema   = text_to_cstring(schema_t);
-    char  *fname    = text_to_cstring(name_t);
+/* Constant-time check of a user-supplied hex key against g_key */
+static bool
+key_matches(const char *key)
+{
+    uint8_t kb[WRAP_KEY_LEN];
+    bool    ok = true;
+    int     i;
+
+    if (strlen(key) != WRAP_KEY_LEN * 2)
+        return false;
+
+    for (i = 0; i < WRAP_KEY_LEN; i++)
+    {
+        int hi = hex_nibble((unsigned char) key[2*i]);
+        int lo = hex_nibble((unsigned char) key[2*i + 1]);
+
+        if (hi < 0 || lo < 0)
+            ok = false;
+        kb[i] = (uint8_t) (((hi < 0 ? 0 : hi) << 4) | (lo < 0 ? 0 : lo));
+    }
+    if (CRYPTO_memcmp(kb, g_key, WRAP_KEY_LEN) != 0)
+        ok = false;
+    explicit_bzero(kb, sizeof(kb));
+    return ok;
+}
+
+static void
+do_unwrap_procedure(FunctionCallInfo fcinfo)
+{
+    char  *key;
+    char  *schema;
+    char  *fname;
     char  *args_str = NULL;
+    bool   key_ok;
 
     Oid    fn_oid   = InvalidOid;
     char  *prosrc, *plain_src;
@@ -1098,73 +1209,65 @@ pgwrap_unwrap_procedure(PG_FUNCTION_ARGS)
     HeapTuple tup;
     StringInfoData query;
 
-    if (PG_NARGS() > 3 && !PG_ARGISNULL(3))
-	    args_str = text_to_cstring(PG_GETARG_TEXT_PP(3));
-
-    if (strcmp(key, WRAP_KEY_HEX) != 0)
-        ereport(ERROR,
-                (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
-                 errmsg("plpgsql_wrap: wrong key to unwrap procedure")));
-
+    /* Privilege first: never tell a non-superuser whether a key is right */
     if (!superuser())
         ereport(ERROR,
                 (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
                  errmsg("plpgsql_wrap: only superusers may unwrap")));
 
-    /* ---- Resolve OID  --  handle overloaded functions ------------- */
+    key    = text_to_cstring(PG_GETARG_TEXT_PP(0));
+    key_ok = key_matches(key);
+    explicit_bzero(key, strlen(key));
+    pfree(key);
+    if (!key_ok)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+                 errmsg("plpgsql_wrap: wrong key to unwrap procedure")));
+
+    schema = text_to_cstring(PG_GETARG_TEXT_PP(1));
+    fname  = text_to_cstring(PG_GETARG_TEXT_PP(2));
+    if (PG_NARGS() > 3 && !PG_ARGISNULL(3))
+        args_str = text_to_cstring(PG_GETARG_TEXT_PP(3));
+
+    /* ---- Resolve OID among plpgsql_wrap functions only ------------ */
     if (SPI_connect() != SPI_OK_CONNECT)
         elog(ERROR, "plpgsql_wrap: SPI_connect failed");
-    else
-        initStringInfo(&query);
+    initStringInfo(&query);
 
+    appendStringInfo(&query,
+        "SELECT p.oid "
+        "  FROM pg_catalog.pg_proc      p "
+        "  JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace "
+        "  JOIN pg_catalog.pg_language  l ON l.oid = p.prolang "
+        " WHERE l.lanname = 'plpgsql_wrap' "
+        "   AND n.nspname = %s "
+        "   AND p.proname = %s",
+        quote_literal_cstr(schema),
+        quote_literal_cstr(fname));
     if (args_str != NULL)
-    {
-        /* Disambiguate by identity argument string */
-	appendStringInfo(&query,
-            "SELECT p.oid "
-            "  FROM pg_catalog.pg_proc      p "
-            "  JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace "
-            " WHERE n.nspname = %s "
-            "   AND p.proname = %s "
+        appendStringInfo(&query,
             "   AND pg_catalog.pg_get_function_identity_arguments(p.oid) = %s",
-            quote_literal_cstr(schema),
-            quote_literal_cstr(fname),
             quote_literal_cstr(args_str));
-    }
-    else
-    {
-	appendStringInfo(&query,
-            "SELECT p.oid "
-            "  FROM pg_catalog.pg_proc      p "
-            "  JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace "
-            " WHERE n.nspname = %s AND p.proname = %s",
-            quote_literal_cstr(schema),
-            quote_literal_cstr(fname));
 
-    }
-
-    spi_rc = SPI_execute(query.data, true, 1);
+    /* fetch up to 2 rows so that ambiguity can actually be detected */
+    spi_rc = SPI_execute(query.data, true, 2);
 
     if (spi_rc != SPI_OK_SELECT || SPI_processed == 0)
-    {
-        SPI_finish();
         ereport(ERROR,
                 (errcode(ERRCODE_UNDEFINED_FUNCTION),
-                 errmsg("plpgsql_wrap: function %s.%s%s%s not found",
+                 errmsg("plpgsql_wrap: wrapped function %s.%s%s%s%s not found",
                         schema, fname,
                         (args_str != NULL) ? "(" : "",
-                        (args_str != NULL) ? args_str : "")));
-    }
+                        (args_str != NULL) ? args_str : "",
+                        (args_str != NULL) ? ")" : "")));
 
     if (SPI_processed > 1)
-    {
-        SPI_finish();
         ereport(ERROR,
                 (errcode(ERRCODE_AMBIGUOUS_FUNCTION),
-                 errmsg("plpgsql_wrap: function name %s.%s is ambiguous  --  "
-                        "supply the argument list as the third parameter",
-                        schema, fname)));
-    }
+                 errmsg("plpgsql_wrap: function name %s.%s is ambiguous",
+                        schema, fname),
+                 errhint("Supply the identity argument list as the fourth "
+                         "parameter.")));
 
     fn_oid = DatumGetObjectId(
         SPI_getbinval(SPI_tuptable->vals[0],
@@ -1210,6 +1313,30 @@ pgwrap_unwrap_procedure(PG_FUNCTION_ARGS)
 
     explicit_bzero(plain_src, strlen(plain_src));
     pfree(plain_src);
+}
+
+PG_FUNCTION_INFO_V1(pgwrap_unwrap_procedure);
+Datum
+pgwrap_unwrap_procedure(PG_FUNCTION_ARGS)
+{
+    MemoryContext oldcxt = CurrentMemoryContext;
+
+    PG_TRY();
+    {
+        do_unwrap_procedure(fcinfo);
+    }
+    PG_CATCH();
+    {
+        ErrorData *edata;
+
+        /* re-throw the same error, without logging the statement (key) */
+        MemoryContextSwitchTo(oldcxt);
+        edata = CopyErrorData();
+        FlushErrorState();
+        edata->hide_stmt = true;
+        ReThrowError(edata);
+    }
+    PG_END_TRY();
 
     PG_RETURN_VOID();
 }

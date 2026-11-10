@@ -1,0 +1,211 @@
+-- 06_security.sql
+--
+-- Regression tests for the security fixes of version 1.1.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS plpgsql_wrap;
+RESET client_min_messages;
+\set VERBOSITY terse
+CREATE ROLE regress_pwrap_user;
+CREATE SCHEMA regress_pwrap AUTHORIZATION regress_pwrap_user;
+GRANT USAGE ON SCHEMA plpgsql_wrap TO regress_pwrap_user;
+CREATE TABLE public.regress_pwrap_log (who name);
+GRANT INSERT ON public.regress_pwrap_log TO PUBLIC;
+-- ====================================================================
+-- 1. Validator: no direct call on functions of other languages
+-- ====================================================================
+SELECT has_function_privilege('regress_pwrap_user',
+                              'plpgsql_wrap.validator(oid)', 'EXECUTE');
+ has_function_privilege 
+------------------------
+ f
+(1 row)
+
+SET ROLE regress_pwrap_user;
+CREATE FUNCTION regress_pwrap.plf(x int) RETURNS int LANGUAGE plpgsql
+    AS $$ BEGIN RETURN x + 1; END $$;
+CREATE FUNCTION regress_pwrap.sqlf() RETURNS int LANGUAGE sql AS 'SELECT 42';
+-- not executable by an ordinary user
+SELECT plpgsql_wrap.validator('regress_pwrap.plf(int)'::regprocedure);
+ERROR:  permission denied for function validator
+RESET ROLE;
+-- even for a superuser, the C code refuses non plpgsql_wrap functions
+DO $$
+BEGIN
+    PERFORM plpgsql_wrap.validator('regress_pwrap.plf(int)'::regprocedure);
+EXCEPTION WHEN insufficient_privilege THEN
+    RAISE NOTICE 'plpgsql function refused (%)', SQLSTATE;
+END $$;
+NOTICE:  plpgsql function refused (42501)
+SET check_function_bodies = off;
+DO $$
+BEGIN
+    PERFORM plpgsql_wrap.validator('regress_pwrap.sqlf()'::regprocedure);
+EXCEPTION WHEN insufficient_privilege THEN
+    RAISE NOTICE 'sql function refused (%)', SQLSTATE;
+END $$;
+NOTICE:  sql function refused (42501)
+RESET check_function_bodies;
+-- both functions are intact
+SELECT p.proname, l.lanname, p.prosrc
+  FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang
+ WHERE p.pronamespace = 'regress_pwrap'::regnamespace
+ ORDER BY p.proname;
+ proname | lanname |          prosrc           
+---------+---------+---------------------------
+ plf     | plpgsql |  BEGIN RETURN x + 1; END 
+ sqlf    | sql     | SELECT 42
+(2 rows)
+
+SELECT regress_pwrap.plf(1), regress_pwrap.sqlf();
+ plf | sqlf 
+-----+------
+   2 |   42
+(1 row)
+
+-- a plpgsql_wrap function can still be validated
+CREATE FUNCTION regress_pwrap.wf(x int) RETURNS int LANGUAGE plpgsql_wrap
+    AS $$ BEGIN RETURN x * 3; END $$;
+WARNING:  plpgsql_wrap was built with the default all-zero key, wrapped code is not protected
+SELECT plpgsql_wrap.validator('regress_pwrap.wf(int)'::regprocedure);
+ validator 
+-----------
+ 
+(1 row)
+
+SELECT regress_pwrap.wf(2);
+ wf 
+----
+  6
+(1 row)
+
+-- ====================================================================
+-- 2. verify_blob: real GCM check, not SECURITY DEFINER
+-- ====================================================================
+SELECT l.lanname, p.prosecdef
+  FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang
+ WHERE p.oid = 'plpgsql_wrap.verify_blob(text)'::regprocedure;
+ lanname | prosecdef 
+---------+-----------
+ c       | f
+(1 row)
+
+SELECT prosrc AS blob FROM pg_proc
+ WHERE oid = 'regress_pwrap.wf(int)'::regprocedure \gset
+SELECT plpgsql_wrap.verify_blob(:'blob');
+ verify_blob 
+-------------
+ t
+(1 row)
+
+SELECT plpgsql_wrap.verify_blob('not a wrapped body');
+ verify_blob 
+-------------
+ f
+(1 row)
+
+-- flip one ciphertext nibble: authentication must fail
+SELECT plpgsql_wrap.verify_blob(
+         overlay(:'blob' PLACING
+                 CASE WHEN substr(:'blob', 100, 1) = '0' THEN '1' ELSE '0' END
+                 FROM 100 FOR 1));
+ERROR:  plpgsql_wrap: authentication failed  --  wrong compile-time key or tampered blob
+-- search_path hijack attempt by an unprivileged user
+SET ROLE regress_pwrap_user;
+CREATE FUNCTION regress_pwrap.evil(text, text) RETURNS bool LANGUAGE sql AS
+    $$ INSERT INTO public.regress_pwrap_log VALUES (current_user); SELECT true $$;
+CREATE OPERATOR regress_pwrap.!~~ (leftarg = text, rightarg = text,
+                                   function = regress_pwrap.evil);
+CREATE OPERATOR regress_pwrap.~~  (leftarg = text, rightarg = text,
+                                   function = regress_pwrap.evil);
+SET search_path = regress_pwrap, pg_catalog;
+SELECT plpgsql_wrap.verify_blob('x');
+ verify_blob 
+-------------
+ f
+(1 row)
+
+RESET search_path;
+RESET ROLE;
+SELECT count(*) AS hijacked FROM public.regress_pwrap_log;
+ hijacked 
+----------
+        0
+(1 row)
+
+-- ====================================================================
+-- 3. unwrap_procedure
+-- ====================================================================
+GRANT EXECUTE ON FUNCTION plpgsql_wrap.unwrap_procedure(text, text, text)
+    TO regress_pwrap_user;
+SET ROLE regress_pwrap_user;
+-- privilege is checked before the key, right or wrong
+SELECT plpgsql_wrap.unwrap_procedure(repeat('0', 64), 'regress_pwrap', 'wf');
+ERROR:  plpgsql_wrap: only superusers may unwrap
+SELECT plpgsql_wrap.unwrap_procedure('bad', 'regress_pwrap', 'wf');
+ERROR:  plpgsql_wrap: only superusers may unwrap
+RESET ROLE;
+SELECT plpgsql_wrap.unwrap_procedure('bad', 'regress_pwrap', 'wf');
+ERROR:  plpgsql_wrap: wrong key to unwrap procedure
+SELECT plpgsql_wrap.unwrap_procedure(repeat('0', 63) || 'g', 'regress_pwrap', 'wf');
+ERROR:  plpgsql_wrap: wrong key to unwrap procedure
+SELECT plpgsql_wrap.unwrap_procedure(repeat('0', 66), 'regress_pwrap', 'wf');
+ERROR:  plpgsql_wrap: wrong key to unwrap procedure
+-- overloaded wrapped functions: ambiguity is detected
+CREATE FUNCTION regress_pwrap.ovl(a int) RETURNS int LANGUAGE plpgsql_wrap
+    AS $$ BEGIN RETURN 1; END $$;
+WARNING:  plpgsql_wrap was built with the default all-zero key, wrapped code is not protected
+CREATE FUNCTION regress_pwrap.ovl(a text) RETURNS int LANGUAGE plpgsql_wrap
+    AS $$ BEGIN RETURN 2; END $$;
+WARNING:  plpgsql_wrap was built with the default all-zero key, wrapped code is not protected
+SELECT plpgsql_wrap.unwrap_procedure(repeat('0', 64), 'regress_pwrap', 'ovl');
+ERROR:  plpgsql_wrap: function name regress_pwrap.ovl is ambiguous
+SELECT plpgsql_wrap.unwrap_procedure(repeat('0', 64), 'regress_pwrap', 'ovl', 'a text');
+ unwrap_procedure 
+------------------
+ 
+(1 row)
+
+SELECT p.oid::regprocedure, l.lanname
+  FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang
+ WHERE p.proname = 'ovl' ORDER BY 1::text;
+            oid             |   lanname    
+----------------------------+--------------
+ regress_pwrap.ovl(integer) | plpgsql_wrap
+ regress_pwrap.ovl(text)    | plpgsql
+(2 rows)
+
+-- only one wrapped overload left: no longer ambiguous
+SELECT plpgsql_wrap.unwrap_procedure(repeat('0', 64), 'regress_pwrap', 'ovl');
+ unwrap_procedure 
+------------------
+ 
+(1 row)
+
+SELECT regress_pwrap.ovl(1), regress_pwrap.ovl('x');
+ ovl | ovl 
+-----+-----
+   1 |   2
+(1 row)
+
+-- functions of other languages are never candidates
+SELECT plpgsql_wrap.unwrap_procedure(repeat('0', 64), 'regress_pwrap', 'plf');
+ERROR:  plpgsql_wrap: wrapped function regress_pwrap.plf not found
+-- ====================================================================
+-- 4. Strict hex decoding of wrapped bodies
+-- ====================================================================
+CREATE FUNCTION regress_pwrap.badhex() RETURNS int LANGUAGE plpgsql_wrap
+    AS $$PLPGSQLWRAP:1:+1$$;
+ERROR:  plpgsql_wrap: invalid hex char in prosrc at position 0
+CREATE FUNCTION regress_pwrap.badhex() RETURNS int LANGUAGE plpgsql_wrap
+    AS $$PLPGSQLWRAP:1: 1$$;
+ERROR:  plpgsql_wrap: invalid hex char in prosrc at position 0
+-- ====================================================================
+-- Cleanup
+-- ====================================================================
+DROP SCHEMA regress_pwrap CASCADE;
+NOTICE:  drop cascades to 8 other objects
+DROP TABLE public.regress_pwrap_log;
+REVOKE USAGE ON SCHEMA plpgsql_wrap FROM regress_pwrap_user;
+REVOKE EXECUTE ON FUNCTION plpgsql_wrap.unwrap_procedure(text, text, text)
+    FROM regress_pwrap_user;
+DROP ROLE regress_pwrap_user;

@@ -9,6 +9,8 @@ BEGIN
     RETURN a + b;
 END;
 $$;
+WARNING:  plpgsql_wrap was built with the default all-zero key, wrapped code is not protected
+HINT:  Rebuild with make WRAP_KEY_HEX=$(openssl rand -hex 32) after unwrapping existing functions.
 -- 2. Call it — transparent execution
 SELECT wrap_add(19, 23);     -- expect 42
  wrap_add 

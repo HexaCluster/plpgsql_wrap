@@ -23,13 +23,15 @@
  *   DO $$
  *   DECLARE r record;
  *   BEGIN
- *     FOR r IN SELECT nspname AS schema, proname AS name
+ *     FOR r IN SELECT nspname AS schema, proname AS name,
+ *                     pg_get_function_identity_arguments(p.oid) AS args
  *              FROM pg_proc p
  *              JOIN pg_namespace n ON n.oid = p.pronamespace
  *              JOIN pg_language  l ON l.oid = p.prolang
  *              WHERE l.lanname = 'plpgsql_wrap'
  *     LOOP
- *         PERFORM plpgsql_wrap.unwrap_procedure(r.schema, r.name);
+ *         PERFORM plpgsql_wrap.unwrap_procedure('<old key hex>',
+ *                                               r.schema, r.name, r.args);
  *     END LOOP;
  *   END;
  *   $$;
@@ -37,10 +39,14 @@
  *
  * SECURITY
  * --------
- * The key is a static constant in the .so's .rodata section.
- * It is NOT exported as a named symbol.
+ * The build converts this key into XOR-masked byte arrays
+ * (wrap_key_data.h, generated): it is not stored as a hex string in the
+ * .so and cannot be found with strings(1).  This is obfuscation only:
+ * anybody who can read and reverse plpgsql_wrap.so can recover the key,
+ * so restrict read access to the installed .so and to wrap_key_data.h.
  * This matches Oracle WRAP: protection is against database-level
  * inspection, not against an OS-level attacker who controls the binary.
+ * The default all-zero key below offers no protection at all.
  */
 
 #ifndef WRAP_KEY_H

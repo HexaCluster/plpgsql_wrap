@@ -8,6 +8,8 @@ BEGIN
     RETURN n * 2;
 END;
 $$;
+WARNING:  plpgsql_wrap was built with the default all-zero key, wrapped code is not protected
+HINT:  Rebuild with make WRAP_KEY_HEX=$(openssl rand -hex 32) after unwrapping existing functions.
 SELECT wrap_double(7);      -- expect 14
  wrap_double 
 -------------
@@ -26,6 +28,8 @@ BEGIN
     RETURN n * 2 + 1;      -- changed
 END;
 $$;
+WARNING:  plpgsql_wrap was built with the default all-zero key, wrapped code is not protected
+HINT:  Rebuild with make WRAP_KEY_HEX=$(openssl rand -hex 32) after unwrapping existing functions.
 SELECT wrap_double(7);      -- expect 15
  wrap_double 
 -------------

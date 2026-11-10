@@ -8,6 +8,8 @@ BEGIN
     RETURN 'Hello, ' || who || '!';
 END;
 $$;
+WARNING:  plpgsql_wrap was built with the default all-zero key, wrapped code is not protected
+HINT:  Rebuild with make WRAP_KEY_HEX=$(openssl rand -hex 32) after unwrapping existing functions.
 SELECT wrap_greet('world');     -- expect: Hello, world!
   wrap_greet   
 ---------------
@@ -78,6 +80,8 @@ BEGIN
     RETURN 'Hello, ' || who || '!';
 END;
 $$;
+WARNING:  plpgsql_wrap was built with the default all-zero key, wrapped code is not protected
+HINT:  Rebuild with make WRAP_KEY_HEX=$(openssl rand -hex 32) after unwrapping existing functions.
 SELECT wrap_greet('world');     -- expect: Hello, world!
   wrap_greet   
 ---------------

@@ -21,6 +21,8 @@ BEGIN
     RETURN n * n * n;
 END;
 $$;
+WARNING:  plpgsql_wrap was built with the default all-zero key, wrapped code is not protected
+HINT:  Rebuild with make WRAP_KEY_HEX=$(openssl rand -hex 32) after unwrapping existing functions.
 SELECT wrap_cube(3);    -- expect 27
  wrap_cube 
 -----------

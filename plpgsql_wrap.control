@@ -1,5 +1,5 @@
 comment         = 'Oracle-WRAP equivalent: AES-256-GCM encrypted PL/pgSQL stored in pg_proc'
-default_version = '1.0'
+default_version = '1.1'
 relocatable     = false
 superuser       = true
 requires        = 'plpgsql'
