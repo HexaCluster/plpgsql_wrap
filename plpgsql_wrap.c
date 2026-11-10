@@ -28,12 +28,14 @@
  *    A CI/CD pipeline or DBA may wrap source externally and supply the
  *    blob as the AS $$ body.  Treated identically to the restore path.
  *
- * 4. Direct plpgsql invocation (no pg_temp, no SPI round-trip).
- *    The call handler temporarily swaps pg_proc.prolang to plpgsql and
- *    pg_proc.prosrc to the decrypted plain source, then invokes the real
- *    plpgsql call handler via fmgr.  plpgsql compiles and caches the
- *    function through its own internal plan cache.  After the call,
- *    the wrapped prosrc and plpgsql_wrap lang OID are restored.
+ * 4. Direct plpgsql invocation (no pg_temp, no SPI round-trip, no catalog
+ *    write at execution time).
+ *    The call handler never modifies pg_proc.  The decrypted source is
+ *    exposed to plpgsql_compile() only, through a backend-local, in-memory
+ *    substitution of the pinned PROCOID syscache entry, then the real
+ *    plpgsql call handler is invoked via fmgr.  plpgsql compiles and caches
+ *    the function through its own internal cache, keyed on the real
+ *    pg_proc row (xmin/ctid), so it is compiled once per session.
  *
  * 5. Inline handler (DO blocks).
  *    LANGUAGE plpgsql_wrap works in DO $$ ... $$ blocks; the body is
@@ -64,13 +66,14 @@
  *
  * CALL HANDLER STRATEGY
  * =====================
- *   1. Decrypt pg_proc.prosrc -> plain source
- *   2. Write plain source + set prolang = plpgsql in pg_proc
- *   3. Invoke plpgsql_call_handler(fn_oid) via fmgr directly
- *      plpgsql compiles and caches the function in its own plan cache
- *   4. Re-encrypt plain source -> blob
- *   5. Restore pg_proc.prosrc = blob, prolang = plpgsql_wrap
- *   6. Wipe plain source from memory
+ *   1. Pin the PROCOID syscache entry, decrypt prosrc -> plain source
+ *   2. Point the pinned entry's t_data at an in-memory copy of the row
+ *      carrying the plain source (original xmin/ctid kept)
+ *   3. Call plpgsql_compile(): compiles, or reuses its valid cached copy
+ *   4. Restore the syscache entry, wipe the plain copy, unpin
+ *   5. Invoke plpgsql_call_handler() via fmgr to execute the body
+ *   No pg_proc update: safe under concurrency (issue #2), on hot standby,
+ *   and the plain source never reaches the heap or the WAL.
  *
  * PROSRC FORMAT
  * =============
@@ -166,12 +169,18 @@ PG_MODULE_MAGIC;
  * Caches the OIDs needed to invoke plpgsql directly so we only look
  * them up once per session per function.
  * ==================================================================== */
+/* plpgsql_compile(FunctionCallInfo, bool) -- PGDLLEXPORT'ed by plpgsql */
+typedef void *(*plpgsql_compile_fn) (FunctionCallInfo fcinfo, bool forValidator);
+
 typedef struct WrapCacheEntry
 {
     Oid     fn_oid;             /* function OID this entry is for           */
     Oid     plpgsql_call_oid;   /* OID of plpgsql_call_handler()            */
     Oid     plpgsql_lang_oid;   /* OID of the plpgsql language              */
-    Oid     wrap_lang_oid;      /* OID of plpgsql_wrap (our language)       */
+    plpgsql_compile_fn plpgsql_compile; /* plpgsql's compiler entry point   */
+    FmgrInfo plpgsql_flinfo;    /* persistent flinfo used to call plpgsql;
+                                 * its fn_extra holds plpgsql's compiled
+                                 * function for this call site             */
 } WrapCacheEntry;
 
 /* ====================================================================
@@ -826,51 +835,160 @@ pgwrap_inline_handler(PG_FUNCTION_ARGS)
  *
  * Called for every invocation of a plpgsql_wrap function.
  *
- * Strategy: temporarily swap prolang to plpgsql, invoke the real
- * plpgsql call handler via fmgr, then restore prolang to plpgsql_wrap.
+ * Previous versions swapped pg_proc.prosrc/prolang on disk around every
+ * call.  Two sessions calling the same function then updated the same
+ * catalog row and failed with "tuple concurrently updated" (issue #2);
+ * it also bloated pg_proc, forced a plpgsql recompilation on every call,
+ * wrote the plain source to the WAL and could not work on a standby.
  *
- * This is the same prolang-swap technique used in the validator.
- * It avoids all pg_temp schema issues and lets plpgsql compile and
- * cache the function body through its own internal mechanisms.
+ * Execution flow (see compile_with_plain_source()):
+ *   1. Decrypt the wrapped prosrc in memory.
+ *   2. Let plpgsql_compile() see the plain source through a temporary,
+ *      backend-local substitution of the pinned syscache entry.
+ *   3. Restore the syscache entry and wipe the plain copy.
+ *   4. Invoke plpgsql_call_handler() via fmgr; it finds its compiled
+ *      function still valid and executes it.
  *
- * Execution flow:
- *   1. Decrypt pg_proc.prosrc -> plain PL/pgSQL source.
- *   2. Write plain source back to pg_proc.prosrc.
- *   3. Set pg_proc.prolang = plpgsql.
- *   4. CommandCounterIncrement so plpgsql sees both changes.
- *   5. Invoke plpgsql_call_handler(fn_oid) via fmgr  --  plpgsql compiles
- *      and executes the function normally, using its own plan cache.
- *   6. Restore pg_proc.prosrc = wrapped blob.
- *   7. Restore pg_proc.prolang = plpgsql_wrap.
- *   8. Wipe the plain source from memory.
- *
- * Per-session cache (fn_extra / WrapCacheEntry):
- *   Stores the OIDs needed so we skip repeated syscache lookups.
- *   plpgsql itself caches the compiled function internally across calls,
- *   so steps 2-7 happen on every call but the expensive parse/compile
- *   only happens once per session inside plpgsql's own cache.
+ * Per-call-site cache (fn_extra / WrapCacheEntry):
+ *   Stores the plpgsql handler/compiler entry points and a persistent
+ *   FmgrInfo whose fn_extra holds plpgsql's compiled function.
  * ==================================================================== */
+/*
+ * compile_with_plain_source
+ *
+ * Make plpgsql compile (or re-validate its cached copy of) the function
+ * without ever writing the decrypted source to pg_proc.
+ *
+ * plpgsql_compile() fetches the function's pg_proc tuple through the
+ * PROCOID syscache.  We pin that very syscache entry, and for the duration
+ * of the plpgsql_compile() call only we point its t_data at an in-memory
+ * copy of the tuple whose prosrc is the plain source.  The copy keeps the
+ * original tuple header (xmin, ctid, xact infomask bits) and t_self is not
+ * touched, so the PLpgSQL_function cache entry produced is keyed on the
+ * real catalog row and stays valid for later calls.  The original t_data
+ * is restored before returning, and the plain copy is wiped.
+ *
+ * Nothing is written to disk or WAL, nothing is visible to other backends,
+ * and no user code runs while the swap is in effect (compilation only), so
+ * recursive calls and calls from inside the body always see the wrapped
+ * prosrc.
+ *
+ * Between our own SearchSysCache1() and plpgsql's we do not take any lock,
+ * so no invalidation message can be processed there and plpgsql gets the
+ * same (pinned) entry.
+ */
+static void
+compile_with_plain_source(WrapCacheEntry *cache, FunctionCallInfo plfcinfo)
+{
+    Oid           fn_oid = cache->fn_oid;
+    Relation      rel;
+    TupleDesc     desc;
+    HeapTuple     procTup;
+    HeapTuple     plainTup;
+    HeapTupleHeader saved_data;
+    uint32        saved_len;
+    bool          attr_isnull;
+    Datum         prosrc_datum;
+    char         *prosrc;
+    char         *plain_src;
+    Datum         values[Natts_pg_proc];
+    bool          nulls[Natts_pg_proc];
+    bool          replaces[Natts_pg_proc];
+
+    /*
+     * Open pg_proc first: lock acquisition may process invalidations, which
+     * must not happen once the syscache entry has been swapped.
+     */
+    rel  = table_open(ProcedureRelationId, AccessShareLock);
+    desc = RelationGetDescr(rel);
+
+    procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(fn_oid));
+    if (!HeapTupleIsValid(procTup))
+        elog(ERROR, "plpgsql_wrap: pg_proc lookup failed for %u", fn_oid);
+
+    prosrc_datum = SysCacheGetAttr(PROCOID, procTup,
+                                   Anum_pg_proc_prosrc, &attr_isnull);
+    if (attr_isnull)
+        elog(ERROR, "plpgsql_wrap: prosrc is NULL for %u", fn_oid);
+    prosrc = TextDatumGetCString(prosrc_datum);
+
+    /* ---- Decrypt ------------------------------------------------ */
+    {
+        int      blen;
+        uint8_t *blob = prosrc_to_blob(prosrc, &blen);
+
+        if (blob == NULL)
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATA_CORRUPTED),
+                     errmsg("plpgsql_wrap: prosrc for OID %u is not in "
+                            "PLPGSQLWRAP format -- was this function created "
+                            "with LANGUAGE plpgsql_wrap?", fn_oid)));
+        plain_src = aes_decrypt(blob, blen);
+        pfree(blob);
+        pfree(prosrc);
+    }
+
+    /* ---- Build an in-memory copy of the row with the plain source */
+    memset(values,   0, sizeof(values));
+    memset(nulls,    false, sizeof(nulls));
+    memset(replaces, false, sizeof(replaces));
+    values[Anum_pg_proc_prosrc - 1]   = CStringGetTextDatum(plain_src);
+    replaces[Anum_pg_proc_prosrc - 1] = true;
+
+    plainTup = heap_modify_tuple(procTup, desc, values, nulls, replaces);
+    explicit_bzero(plain_src, strlen(plain_src));
+    pfree(plain_src);
+
+    /* Keep the identity plpgsql uses to validate its cache (xmin, ctid) */
+    plainTup->t_data->t_choice = procTup->t_data->t_choice;
+    plainTup->t_data->t_ctid   = procTup->t_data->t_ctid;
+    plainTup->t_data->t_infomask =
+        (plainTup->t_data->t_infomask & ~HEAP_XACT_MASK) |
+        (procTup->t_data->t_infomask & HEAP_XACT_MASK);
+
+    /* ---- Swap, compile, restore --------------------------------- */
+    saved_data = procTup->t_data;
+    saved_len  = procTup->t_len;
+    procTup->t_data = plainTup->t_data;
+    procTup->t_len  = plainTup->t_len;
+
+    PG_TRY();
+    {
+        (void) cache->plpgsql_compile(plfcinfo, false);
+    }
+    PG_CATCH();
+    {
+        procTup->t_data = saved_data;
+        procTup->t_len  = saved_len;
+        explicit_bzero(plainTup->t_data, plainTup->t_len);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
+    procTup->t_data = saved_data;
+    procTup->t_len  = saved_len;
+    explicit_bzero(plainTup->t_data, plainTup->t_len);
+    heap_freetuple(plainTup);
+
+    ReleaseSysCache(procTup);
+    table_close(rel, AccessShareLock);
+}
+
 PG_FUNCTION_INFO_V1(pgwrap_call_handler);
 Datum
 pgwrap_call_handler(PG_FUNCTION_ARGS)
 {
     Oid              fn_oid = fcinfo->flinfo->fn_oid;
     WrapCacheEntry  *cache;
-    HeapTuple        procTup;
-    bool             attr_isnull;
-    Datum            prosrc_datum;
-    char            *prosrc;
-    char            *plain_src;
-    char            *orig_wrapped_prosrc;
     Datum            result;
-    FmgrInfo         plpgsql_flinfo;
     FunctionCallInfo plpgsql_fcinfo;
 
-    /* ---- Per-session cache: resolve OIDs once per session ------- */
+    /* ---- Per-call-site cache: resolve handlers once ------------- */
     if (fcinfo->flinfo->fn_extra == NULL)
     {
         HeapTuple        lang_tup;
         Form_pg_language lf;
+        MemoryContext    oldcxt;
 
         cache = (WrapCacheEntry *)
             MemoryContextAllocZero(fcinfo->flinfo->fn_mcxt,
@@ -893,15 +1011,27 @@ pgwrap_call_handler(PG_FUNCTION_ARGS)
                     (errcode(ERRCODE_UNDEFINED_OBJECT),
                      errmsg("plpgsql_wrap: plpgsql has no call handler")));
 
-        /* Resolve plpgsql_wrap language OID from our own pg_proc row */
-        procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(fn_oid));
-        if (!HeapTupleIsValid(procTup))
-            ereport(ERROR,
-                    (errmsg("plpgsql_wrap: pg_proc lookup failed for %u",
-                            fn_oid)));
-        cache->wrap_lang_oid =
-            ((Form_pg_proc) GETSTRUCT(procTup))->prolang;
-        ReleaseSysCache(procTup);
+        /* plpgsql's exported compiler entry point (also loads plpgsql) */
+        cache->plpgsql_compile = (plpgsql_compile_fn)
+            load_external_function("$libdir/plpgsql", "plpgsql_compile",
+                                   true, NULL);
+
+        /*
+         * Persistent FmgrInfo for plpgsql: a copy of ours (fn_oid, nargs,
+         * strict, retset, fn_expr for polymorphic resolution...) with
+         * plpgsql_call_handler as the entry point.  Its fn_extra keeps
+         * plpgsql's compiled function across calls from this call site.
+         */
+        oldcxt = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
+        {
+            FmgrInfo handler;
+
+            fmgr_info(cache->plpgsql_call_oid, &handler);
+            cache->plpgsql_flinfo          = *fcinfo->flinfo;
+            cache->plpgsql_flinfo.fn_addr  = handler.fn_addr;
+            cache->plpgsql_flinfo.fn_extra = NULL;
+        }
+        MemoryContextSwitchTo(oldcxt);
 
         fcinfo->flinfo->fn_extra = cache;
     }
@@ -910,92 +1040,29 @@ pgwrap_call_handler(PG_FUNCTION_ARGS)
         cache = (WrapCacheEntry *) fcinfo->flinfo->fn_extra;
     }
 
-    /* ---- Read current wrapped prosrc from pg_proc --------------- */
-    procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(fn_oid));
-    if (!HeapTupleIsValid(procTup))
-        elog(ERROR, "plpgsql_wrap: pg_proc lookup failed for %u", fn_oid);
-
-    prosrc_datum = SysCacheGetAttr(PROCOID, procTup,
-                                   Anum_pg_proc_prosrc, &attr_isnull);
-    if (attr_isnull)
-    {
-        ReleaseSysCache(procTup);
-        elog(ERROR, "plpgsql_wrap: prosrc is NULL for %u", fn_oid);
-    }
-    prosrc = TextDatumGetCString(prosrc_datum);
-    ReleaseSysCache(procTup);
-
-    /* ---- Decrypt ------------------------------------------------ */
-    {
-        int      blen;
-        uint8_t *blob = prosrc_to_blob(prosrc, &blen);
-
-        if (blob == NULL)
-            ereport(ERROR,
-                    (errcode(ERRCODE_DATA_CORRUPTED),
-                     errmsg("plpgsql_wrap: prosrc for OID %u is not in "
-                            "PLPGSQLWRAP format -- was this function created "
-                            "with LANGUAGE plpgsql_wrap?", fn_oid)));
-        plain_src = aes_decrypt(blob, blen);
-        pfree(blob);
-    }
-
-    /*
-     * Save the original wrapped prosrc string for restore after execution.
-     * We use fn_mcxt so the pointer survives PG_CATCH cleanup.
-     * We store it separately from prosrc (which was palloc'd in the call
-     * context and may be freed by the memory-context cleanup on error).
-     */
-    orig_wrapped_prosrc = MemoryContextStrdup(fcinfo->flinfo->fn_mcxt, prosrc);
-    pfree(prosrc);
-
-    /* ---- Temporarily expose plain source to plpgsql ------------ */
-    /*
-     * Write plain source + prolang=plpgsql so plpgsql_call_handler can
-     * compile and execute the function through its own plan cache.
-     * The same prolang-swap technique is used in the validator.
-     */
-    update_prosrc_and_lang(fn_oid, plain_src, cache->plpgsql_lang_oid);
-    CommandCounterIncrement();
-
-    /* ---- Invoke plpgsql call handler directly via fmgr ---------- */
-    fmgr_info_cxt(cache->plpgsql_call_oid, &plpgsql_flinfo,
-                  fcinfo->flinfo->fn_mcxt);
-    plpgsql_flinfo.fn_oid   = fn_oid;
-    plpgsql_flinfo.fn_extra = NULL;   /* plpgsql manages its own fn_extra */
+    /* fn_expr may be (re)attached by the executor; keep it in sync */
+    cache->plpgsql_flinfo.fn_expr = fcinfo->flinfo->fn_expr;
 
     plpgsql_fcinfo = palloc(SizeForFunctionCallInfo(fcinfo->nargs));
     memcpy(plpgsql_fcinfo, fcinfo, SizeForFunctionCallInfo(fcinfo->nargs));
-    plpgsql_fcinfo->flinfo = &plpgsql_flinfo;
+    plpgsql_fcinfo->flinfo = &cache->plpgsql_flinfo;
 
     /*
-     * PG_TRY ensures the wrapped state is always restored in pg_proc,
-     * even when plpgsql raises an error (e.g. a runtime exception inside
-     * the procedure body).
+     * Let plpgsql compile the function from the decrypted source held in
+     * memory only.  If plpgsql already has a valid compiled copy (same
+     * pg_proc xmin/ctid), this is a no-op on its side.
      */
-    PG_TRY();
-    {
-        result = FunctionCallInvoke(plpgsql_fcinfo);
-    }
-    PG_CATCH();
-    {
-        /* Restore wrapped prosrc + language before re-throwing */
-        update_prosrc_and_lang(fn_oid, orig_wrapped_prosrc,
-                               cache->wrap_lang_oid);
-        explicit_bzero(plain_src, strlen(plain_src));
-        pfree(plain_src);
-        CommandCounterIncrement();
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
+    compile_with_plain_source(cache, plpgsql_fcinfo);
 
-    /* ---- Restore wrapped state ---------------------------------- */
-    update_prosrc_and_lang(fn_oid, orig_wrapped_prosrc, cache->wrap_lang_oid);
-    explicit_bzero(plain_src, strlen(plain_src));
-    pfree(plain_src);
-    CommandCounterIncrement();
+    /*
+     * Execute.  plpgsql_call_handler() calls plpgsql_compile() again, finds
+     * the cached function still valid and does not read prosrc.
+     */
+    result = FunctionCallInvoke(plpgsql_fcinfo);
 
-    if (plpgsql_fcinfo->isnull)
+    /* propagate result-related fields set by plpgsql */
+    fcinfo->isnull = plpgsql_fcinfo->isnull;
+    if (fcinfo->isnull)
         PG_RETURN_NULL();
     return result;
 }

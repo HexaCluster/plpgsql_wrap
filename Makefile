@@ -17,7 +17,7 @@ EXTENSION  = plpgsql_wrap
 DATA       = $(wildcard updates/*--*.sql) $(wildcard sql/*.sql)
 DOCS       = README.md
 
-TESTS      =  01_basic 02_unwrap 03_replace 04_dump_restore
+TESTS      =  01_basic 02_unwrap 03_replace 04_dump_restore 05_call_handler
 REGRESS      = $(patsubst test/sql/%.sql,%,$(TESTS))
 REGRESS_OPTS = --inputdir=test
 
